@@ -87,7 +87,7 @@ def idempotency_check(old_val, new_val):
     if isinstance(new_val, dict):
         for key in new_val:
             if key in old_val:
-                if idempotency_check(old_val[key], new_val[key]) is False:
+                if not idempotency_check(old_val[key], new_val[key]):
                     return False
     elif isinstance(new_val, list):
         if len(new_val) != len(old_val):
@@ -260,6 +260,17 @@ def _strip_ignore(d, ignore):
     return _filter(d)
 
 
+def _clean_params(val):
+    """Clean parameter (nested supported) for comparison"""
+    if isinstance(val, dict):
+        return {k: _clean_params(v) for k, v in val.items() if v is not None}
+    elif isinstance(val, list):
+        return [_clean_params(v) for v in val]
+    elif isinstance(val, bool):
+        return val
+    else:
+        return str(val)
+
 def chkp_api_call(module, api_call_object, has_add_api, ignore=None, show_params=None, add_params=None, is_maestro_special=False, compare_params=None):
     target_version = get_version(module)
     changed = False
@@ -283,32 +294,67 @@ def chkp_api_call(module, api_call_object, has_add_api, ignore=None, show_params
     module.params = modules_params_original
     if 'state' in module.params and module.params['state'] == 'absent':  # handle delete
         if is_maestro_special:
+            # no cheap read exists to predict the change, so report it conservatively
+            if module.check_mode:
+                return {'diff': {'before': before, 'after': {}}, "changed": True}
             code, res = api_call(module, target_version, api_call_object="discard-{0}".format(api_call_object))
         else:
             if code == 200:
+                # object exists and would be deleted
+                if module.check_mode:
+                    return {
+                        api_call_object.replace('-', '_'): before,
+                        'diff': {'before': before, 'after': {}},
+                        "changed": True,
+                    }
                 # delete/show require same params
                 module.params = module_params_show
                 code, res = api_call(module, target_version, api_call_object="delete-{0}".format(api_call_object))
             else:
                 return {
                     api_call_object.replace('-', '_'): {},
+                    'diff': {'before': {}, 'after': {}},
                     "changed": False
                 }
     else:  # handle set/add
         if is_maestro_special:
+            if module.check_mode:
+                # no read to compute the resulting state, so no meaningful diff
+                return {
+                    api_call_object.replace('-', '_'): before,
+                    "changed": True,
+                }
             code, res = api_call(module, target_version, api_call_object="apply-{0}".format(api_call_object))
         else:
-            params_dict = dict((k, v) for k, v in module.params.items() if is_checkpoint_param(k) and v is not None)
+            params_dict = dict((k, _clean_params(v)) for k, v in module.params.items() if is_checkpoint_param(k) and v is not None)
 
             if code == 200:
                 params_for_idempotency = compare_params if compare_params is not None else params_dict
                 if idempotency_check(res, params_for_idempotency) is True:
                     return {
                         api_call_object.replace('-', '_'): res,
+                        'diff': {'before': res, 'after': res},
                         "changed": False
+                    }
+                # object exists and would be modified
+                if module.check_mode:
+                    after_preview = dict(before)
+                    after_preview.update(params_for_idempotency)
+                    return {
+                        api_call_object.replace('-', '_'): before,
+                        'diff': {'before': before, 'after': after_preview},
+                        "changed": True,
                     }
                 code, res = api_call(module, target_version, api_call_object="set-{0}".format(api_call_object))
             else:
+                # object does not exist and would be created
+                if module.check_mode:
+                    # Use `params_dict` for after -> 404 error returned by API for certain endpoints
+                    return {
+                        api_call_object.replace('-', '_'): params_dict,
+                        'diff': {'before': {}, 'after': params_dict},
+                        "changed": True,
+                    }
                 if has_add_api is True:
                     if add_params:
                         [module.params.pop(key) for key in show_params if key not in add_params]
@@ -327,17 +373,21 @@ def chkp_api_call(module, api_call_object, has_add_api, ignore=None, show_params
     else:
         module.fail_json(msg=parse_fail_message(code, res))
 
+    # TODO -> bug, if `/set-*` API is called _this should constitute a change_
     after = _strip_ignore(res, ignore)
     changed = False if before == after else True
 
     return {
         api_call_object.replace('-', '_'): res,
+        'diff': {'before': before, 'after': after},
         "changed": changed
     }
 
 
 # for operation and async tasks
 def chkp_api_operation(module, api_call_object):
+    if module.check_mode:
+        return {'changed': True}
     target_version = get_version(module)
     code, response = api_call(module, target_version, api_call_object)
     result = {'changed': True}
