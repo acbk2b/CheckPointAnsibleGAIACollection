@@ -96,9 +96,7 @@ def _normalize_server_for_compare(server):
     if version is not None:
         normalized['ver'] = str(version)
     server_type = server.get('type')
-    if server_type in ('primary', 'secondary'):
-        normalized['type'] = 'server'
-    elif server_type is not None:
+    if server_type is not None:
         normalized['type'] = server_type
     return normalized
 
